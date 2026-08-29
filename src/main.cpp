@@ -19,6 +19,10 @@ float Leistung = 0;
 float Energie = 0;
 float Frequenz = 0;
 
+//Knopf auf dem Bildschirm
+LGFX_Button knopfEinAus;
+bool verbraucherEin = false;
+
 
 void wlanVerbinden(){
   WiFi.persistent(false);
@@ -43,6 +47,7 @@ void wlanVerbinden(){
   Serial.println("Welan verbindung fehlgeschlagen");
 }
 }
+//Messung
 void Messung(){
   Spannung = Messgeraet.voltage();
   Strom = Messgeraet.current();
@@ -50,6 +55,7 @@ void Messung(){
   Energie  = Messgeraet.energy();
   Frequenz = Messgeraet.frequency();
 }
+//Wiedergabe der gemessenen Werte im Serial Monotoring
 void Wert_Wiedergabe_Monitoring(){
   Serial.print("Spannung: ");
 Serial.print(Spannung, 1);
@@ -64,13 +70,56 @@ Serial.print(Frequenz, 1);
 Serial.println("Hz");
 
 }
+void Wiedergabe_Bildschirm(){
+  CoreS3.Display.clear();
+  CoreS3.Display.clear(WHITE);
+  CoreS3.Display.setTextSize(2);
+  CoreS3.Display.setTextColor(BLACK);
+  CoreS3.Display.setCursor(0, 30);
+  CoreS3.Display.print("Spannung:");
+  CoreS3.Display.setCursor(160, 30);
+  CoreS3.Display.print(Spannung);
+  CoreS3.Display.setCursor(0, 60);
+  CoreS3.Display.print("Strom:");
+  CoreS3.Display.setCursor(160, 60);
+  CoreS3.Display.print(Strom);
+  CoreS3.Display.setCursor(0, 90);
+  CoreS3.Display.print("Leistung:");
+  CoreS3.Display.setCursor(160, 90);
+  CoreS3.Display.print(Leistung);
+  CoreS3.Display.setCursor(00, 120);
+  CoreS3.Display.print("Energie:");
+  CoreS3.Display.setCursor(160, 120);
+  CoreS3.Display.print(Energie);
+  CoreS3.Display.setCursor(0, 150);
+  CoreS3.Display.print("Frequenz:");
+  CoreS3.Display.setCursor(160, 150);
+  CoreS3.Display.print(Frequenz);
+  knopfEinAus.drawButton(); 
+}
 
+void Touch_Screen_Ueberpruefung(){
+  CoreS3.update();
+  auto Beruehrungs_Ort = CoreS3.Touch.getDetail();
+  bool gedrueckt = Beruehrungs_Ort.isPressed() && knopfEinAus.contains(Beruehrungs_Ort.x, Beruehrungs_Ort.y);
+  knopfEinAus.press(gedrueckt);
+
+if (knopfEinAus.justPressed()) {
+  verbraucherEin = !verbraucherEin;
+  if (verbraucherEin) {
+  Serial.println("Verbraucher: EIN");
+} else {
+  Serial.println("Verbraucher: AUS");
+}
+}
+}
 
 void setup() {
 
   auto cfg = M5.config(); //Struktur mit Einstellungen für den Start
   cfg.output_power = true;   // 5V-Ausgang aktivieren
   CoreS3.begin(cfg);
+  knopfEinAus.initButton(&CoreS3.Display, 180, 210, 80, 40,TFT_BLACK, TFT_BLACK, TFT_WHITE, "Ein/Aus", 1.5, 1.5);
 
 
   Serial.begin(115200);
@@ -81,6 +130,8 @@ void setup() {
 void loop() {
   Messung();
   Wert_Wiedergabe_Monitoring();
+  Wiedergabe_Bildschirm();
+  Touch_Screen_Ueberpruefung();
 
 
 
