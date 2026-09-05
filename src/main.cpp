@@ -4,6 +4,7 @@
 #include <WiFiMulti.h>      
 #include <PubSubClient.h>    
 #include <PZEM004Tv30.h> 
+#include "pw.h"
 
 WiFiMulti wifiMulti;
 
@@ -26,10 +27,39 @@ bool verbraucherEin = false;
 
 //Pin für das Relais
 #define Relais_Pin 8
+#define RELAIS_EIN LOW
+#define RELAIS_AUS HIGH
 
 //Variabel Bild Wechsel
 int Variabel_Seiten_Wechsel = 0;
 
+WiFiClient netzClient;
+PubSubClient mqtt(netzClient);
+
+const char* TOPIC_MESSWERT = "strommesser/cores3/messwert";
+const char* TOPIC_BEFEHL   = "strommesser/cores3/relais/befehl";
+const char* TOPIC_STATUS   = "strommesser/cores3/relais/status";
+const char* TOPIC_ONLINE   = "strommesser/cores3/status";
+const char* CLIENT_ID      = "cores3-strommesser";
+
+struct Messwerte {
+  float spannung;
+  float strom;
+  float leistung;
+  float energie;
+  float frequenz;
+  int   fehler;
+};
+
+QueueHandle_t qMesswerte;
+QueueHandle_t qAnzeige;
+QueueHandle_t qBefehle;
+QueueHandle_t qStatus;
+
+// Störungsflags: sperren das Einschalten und lösen den Abwurf aus.
+// Getrennt, damit eine Störung die andere nicht überschreibt.
+volatile bool stoerungSensor = false;
+volatile bool stoerungNetz   = false;
 
 void wlanVerbinden(){
   WiFi.persistent(false);
@@ -39,9 +69,9 @@ void wlanVerbinden(){
   WiFi.setAutoReconnect(true);
   
 
-  wifiMulti.addAP("Xiaomi 17T Pro", "1234567890");
-  wifiMulti.addAP("Teko Olten", "ol4600-ch");
-  wifiMulti.addAP("Netz 3", "Passwort 3");//Wlan eintragen(Timo)
+  wifiMulti.addAP(WLAN_SSID_1, WLAN_PASS_1);
+  wifiMulti.addAP(WLAN_SSID_2, WLAN_PASS_2);
+  wifiMulti.addAP(WLAN_SSID_3, WLAN_PASS_3);
 
   if (wifiMulti.run(20000) == WL_CONNECTED) {
   Serial.print("Wlan verbunden");
@@ -51,8 +81,55 @@ void wlanVerbinden(){
 } else {
   Serial.println("Wlan verbindung fehlgeschlagen");
 }
+
 }
-//Messung
+
+// Callback Funktion ruft die Bibliothek selbstständig auf, sobald eine Nachricht auf einem abonnierten Topic eintrifft.
+void mqttEmpfangen(char* topic, byte* nutzlast, unsigned int laenge) {
+  String text = "";
+  for (unsigned int i = 0; i < laenge; i++) {
+    text += (char)nutzlast[i];
+  }
+
+  if (text == "ein" || text == "aus") {
+    bool wunsch = (text == "ein");
+    xQueueSend(qBefehle, &wunsch, 0);
+  }
+}
+// Last Will:  Nachricht, die der Broker verschickt, falls der CoreS3 unsauber verschwindet.
+const char* brokerWaehlen() {
+  if (WiFi.SSID() == WLAN_SSID_2) return MQTT_BROKER_HEIM;
+  return MQTT_BROKER_SCHULE;
+}
+
+bool mqttVerbinden() {
+  mqtt.setServer(brokerWaehlen(), MQTT_PORT);
+  mqtt.setCallback(mqttEmpfangen);
+  mqtt.setBufferSize(512);
+  mqtt.setKeepAlive(15);
+
+  bool ok = mqtt.connect(CLIENT_ID, MQTT_USER, MQTT_PASS,
+                         TOPIC_ONLINE, 1, true, "offline");
+  if (ok) {
+    mqtt.publish(TOPIC_ONLINE, "online", true);
+    mqtt.publish(TOPIC_STATUS, verbraucherEin ? "ein" : "aus", true);
+    mqtt.subscribe(TOPIC_BEFEHL, 1);
+  }
+  return ok;
+}
+
+// Messwerte bekommen JSON. Werden gemeinsasm gesendet. Node-RED wandelt in Felder um. Nur eine MQTT Nachricht.
+void messwerteSenden(const Messwerte& m) {
+  char nutzlast[192];
+  snprintf(nutzlast, sizeof(nutzlast),
+    "{\"spannung\":%.1f,\"strom\":%.3f,\"leistung\":%.1f,"
+    "\"energie\":%.3f,\"frequenz\":%.1f,\"fehler\":%d}",
+    m.spannung, m.strom, m.leistung, m.energie, m.frequenz, m.fehler);
+  mqtt.publish(TOPIC_MESSWERT, nutzlast);
+}
+
+//Messung (benutzen noch globale Variablen. Evtl. in Struct ändern)
+// Inkl. Sensorüberwachung
 void Messung(){
   Spannung = Messgeraet.voltage();
   Strom = Messgeraet.current();
@@ -61,18 +138,12 @@ void Messung(){
   Frequenz = Messgeraet.frequency();
 
   if (isnan(Spannung) or isnan(Strom) or isnan(Leistung) or isnan(Energie) or isnan(Frequenz)){
-    Serial.print("Fehlerhafte Messung");
     Fehler_Variabel_Messgeraet = 1;
-
-  }else if (WiFi.status() != WL_CONNECTED)
-  {
-    Serial.print("Wlan-Verbindungs unterbruch");
-    Fehler_Variabel_Messgeraet = 2;
-  }else{
-    Serial.print("erfolgreiche Messung");
+  } else {
     Fehler_Variabel_Messgeraet = 0;
   }
 }
+
 //Wiedergabe der gemessenen Werte im Serial Monotoring
 void Wert_Wiedergabe_Monitoring(){
 Serial.print("Spannung: ");
@@ -107,32 +178,33 @@ void Nicht_Veraenderbare_Anzeigen(){
   knopfEinAus.drawButton();
 }
 
-//Anzeige der Messwerte
-void Wiedergabe_Bildschirm_Messwerte(){
+//Anzeige der Messwerte. Bekommt Messsatz und nicht globale Variablen. So gehört Anzeige und MQTT Paket immer zusammen.
+void Wiedergabe_Bildschirm_Messwerte(const Messwerte& m){
 
   CoreS3.Display.setTextSize(2);
   CoreS3.Display.setTextColor(BLACK);
   CoreS3.Display.fillRect(160, 30, 100, 20, WHITE);
   CoreS3.Display.setCursor(160, 30);
-  CoreS3.Display.print(Spannung);
+  CoreS3.Display.print(m.spannung);
   CoreS3.Display.print("V");
   CoreS3.Display.fillRect(160, 60, 100, 20, WHITE);
   CoreS3.Display.setCursor(160, 60);
-  CoreS3.Display.print(Strom);
+  CoreS3.Display.print(m.strom);
   CoreS3.Display.print("A");
   CoreS3.Display.fillRect(160, 90, 100, 20, WHITE);
   CoreS3.Display.setCursor(160, 90);
-  CoreS3.Display.print(Leistung);
+  CoreS3.Display.print(m.leistung);
   CoreS3.Display.print("W");
   CoreS3.Display.fillRect(160, 120, 100, 20, WHITE);
   CoreS3.Display.setCursor(160, 120);
-  CoreS3.Display.print(Energie);
-  CoreS3.Display.print("Ws");
+  CoreS3.Display.print(m.energie);
+  CoreS3.Display.print("kWh");
   CoreS3.Display.fillRect(160, 150, 100, 20, WHITE);
   CoreS3.Display.setCursor(160, 150);
-  CoreS3.Display.print(Frequenz);
-  CoreS3.Display.print("Hz"); 
+  CoreS3.Display.print(m.frequenz);
+  CoreS3.Display.print("Hz");
 }
+
 //Anzeige wenn das Messgerät nicht verbunden ist
 void Wiedergabe_Bildschirm_Fehler_Messgeraet(){
   CoreS3.Display.clear();
@@ -171,48 +243,101 @@ if (knopfEinAus.justPressed()) {
 }
 }
 
-void Mess_Task(void *pvParameters){
-  for (;;){
+// Mess-Task: füllt ein Struct statt globale Variablen. Keine Displayaufrufe. Messungen alle 1000ms.
+void Mess_Task(void *pvParameters) {
+  TickType_t letzterStart = xTaskGetTickCount();
+  Messwerte m;
+
+  for (;;) {
     Messung();
-    Wert_Wiedergabe_Monitoring();
-    if (Fehler_Variabel_Messgeraet == 1)
-    {
-      Wiedergabe_Bildschirm_Fehler_Messgeraet();
-      Variabel_Seiten_Wechsel = 1;
-    }else if (Fehler_Variabel_Messgeraet == 2){
-      Wiedergabe_Bildschirm_Fehler_Wlan();
-      Variabel_Seiten_Wechsel = 1;
-    }else if (Fehler_Variabel_Messgeraet == 0 && Variabel_Seiten_Wechsel == 0){
-      Wiedergabe_Bildschirm_Messwerte();
-    }else if (Fehler_Variabel_Messgeraet == 0 && Variabel_Seiten_Wechsel == 1){
-      Nicht_Veraenderbare_Anzeigen();
-      Wiedergabe_Bildschirm_Messwerte();
-      Variabel_Seiten_Wechsel = 0;
+    m.spannung = Spannung;
+    m.strom    = Strom;
+    m.leistung = Leistung;
+    m.energie  = Energie;
+    m.frequenz = Frequenz;
+    m.fehler   = Fehler_Variabel_Messgeraet;
+
+    xQueueSend(qMesswerte, &m, 0);
+    xQueueSend(qAnzeige,   &m, 0);
+
+    bool fehlerJetzt = (m.fehler != 0);
+    if (fehlerJetzt && !stoerungSensor) {
+      bool aus = false;
+      xQueueSend(qBefehle, &aus, 0);
     }
-    vTaskDelay(pdMS_TO_TICKS(5000));
+    stoerungSensor = fehlerJetzt;
+
+    vTaskDelayUntil(&letzterStart, pdMS_TO_TICKS(1000));
   }
 }
 
+// Einzige Kommunikation zu MQTT! Verbindungsversuche zeitlich begrenzt. (Fehlersuche von unten nach oben. WLAN - MQTT - Nutzdaten)
+void Kommunikations_Task(void *pvParameters) {
+  uint32_t naechsterVersuch = 0;
+  Messwerte m;
+  bool status;
 
-void Relais_Task(void *pvParameters){
-for (;;){
-  Touch_Screen_Ueberpruefung();
-  if (Fehler_Variabel_Messgeraet == 1)
-    {
-      Serial.print("Fehler Messgerät");
-      verbraucherEin = false;
-      digitalWrite(Relais_Pin, verbraucherEin);
-    }else if (Fehler_Variabel_Messgeraet == 2){
-      Serial.print("Wlan nicht verbunden");
-      verbraucherEin = false;
-      digitalWrite(Relais_Pin, verbraucherEin);
-    }else if (Fehler_Variabel_Messgeraet == 0){
-      digitalWrite(Relais_Pin, verbraucherEin);
+  for (;;) {
+    bool netzWeg = (WiFi.status() != WL_CONNECTED) || !mqtt.connected();
+    if (netzWeg && !stoerungNetz) {
+      bool aus = false;
+      xQueueSend(qBefehle, &aus, 0);
+    }
+    stoerungNetz = netzWeg;
+
+    if (WiFi.status() != WL_CONNECTED) {
+      if (millis() > naechsterVersuch) {
+        wifiMulti.run(5000);
+        naechsterVersuch = millis() + 10000;
+      }
+    } else if (!mqtt.connected()) {
+      if (millis() > naechsterVersuch) {
+        mqttVerbinden();
+        naechsterVersuch = millis() + 5000;
+      }
+    } else {
+      mqtt.loop();
+      if (xQueueReceive(qMesswerte, &m, 0) == pdTRUE) messwerteSenden(m);
+      if (xQueueReceive(qStatus, &status, 0) == pdTRUE)
+        mqtt.publish(TOPIC_STATUS, status ? "ein" : "aus", true);
     }
     vTaskDelay(pdMS_TO_TICKS(50));
   }
 }
+// Relais Ein- und Ausschalten. Wenn Störung, darf es sich nicht einschalten lassen. Dadurch, dass im Aktor, nur einmal vorhanden.
+void Relais_Task(void *pvParameters) {
+  bool wunsch;
+  for (;;) {
+    if (xQueueReceive(qBefehle, &wunsch, portMAX_DELAY) == pdTRUE) {
+      if (wunsch && (stoerungSensor || stoerungNetz)) wunsch = false;
+        verbraucherEin = wunsch;
+        digitalWrite(Relais_Pin, verbraucherEin ? RELAIS_EIN : RELAIS_AUS);
+        xQueueSend(qStatus, &verbraucherEin, 0);
+    }
+  }
+}
 
+// Anzeige-Task und Touch-Button. Genau ein Task. Mutex dadurch nicht nötig.
+void Anzeige_Task(void *pvParameters) {
+  Messwerte m;
+  for (;;) {
+    CoreS3.update();
+    auto ort = CoreS3.Touch.getDetail();
+    knopfEinAus.press(ort.isPressed() &&
+                      knopfEinAus.contains(ort.x, ort.y));
+
+    if (knopfEinAus.justPressed()) {
+      bool wunsch = !verbraucherEin;
+      xQueueSend(qBefehle, &wunsch, 0);
+    }
+
+    if (xQueueReceive(qAnzeige, &m, 0) == pdTRUE) {
+      if (m.fehler != 0) Wiedergabe_Bildschirm_Fehler_Messgeraet();
+      else               Wiedergabe_Bildschirm_Messwerte(m);
+    }
+    vTaskDelay(pdMS_TO_TICKS(200));
+  }
+}
 
 void setup() {
 
@@ -222,14 +347,31 @@ void setup() {
   knopfEinAus.initButton(&CoreS3.Display, 140, 210, 80, 40,TFT_BLACK, TFT_BLACK, TFT_WHITE, "Ein/Aus", 1.5, 1.5);
   
   //Pin einlesen
+  digitalWrite(Relais_Pin, RELAIS_AUS);
   pinMode(Relais_Pin, OUTPUT);
 
   Serial.begin(115200);
   wlanVerbinden();
 
-  xTaskCreate(Mess_Task, "Mess_Task", 4096, NULL, 1, NULL);
-  xTaskCreate(Relais_Task, "Relais_Task", 4096, NULL, 1, NULL);
+  digitalWrite(Relais_Pin, RELAIS_AUS);
+  pinMode(Relais_Pin, OUTPUT);
+
+  qMesswerte = xQueueCreate(5, sizeof(Messwerte));
+  qAnzeige   = xQueueCreate(2, sizeof(Messwerte));
+  qBefehle   = xQueueCreate(5, sizeof(bool));
+  qStatus    = xQueueCreate(5, sizeof(bool));
+
+  xTaskCreate(Mess_Task,           "Messung", 4096, NULL, 3, NULL);
+  xTaskCreate(Relais_Task,         "Relais",  2048, NULL, 4, NULL);
+  xTaskCreate(Kommunikations_Task, "Komm",    8192, NULL, 2, NULL);
+  xTaskCreate(Anzeige_Task,        "Anzeige", 4096, NULL, 1, NULL);
+
   Nicht_Veraenderbare_Anzeigen();
   
 }
+
+
+
+
+void loop() { vTaskDelay(pdMS_TO_TICKS(1000)); }
 
