@@ -30,6 +30,10 @@ bool verbraucherEin = false;
 #define RELAIS_EIN LOW
 #define RELAIS_AUS HIGH
 
+//Festlegen des Maximalstromes. Abschaltung bei erreichung.
+#define STROM_MAX 5.0
+#define UEBERSTROM_ZYKLEN  3
+
 //Variabel Bild Wechsel
 int Variabel_Seiten_Wechsel = 0;
 
@@ -60,6 +64,7 @@ QueueHandle_t qStatus;
 // Getrennt, damit eine Störung die andere nicht überschreibt.
 volatile bool stoerungSensor = false;
 volatile bool stoerungNetz   = false;
+volatile bool stoerungUeberstrom = false;
 
 void wlanVerbinden(){
   WiFi.persistent(false);
@@ -224,7 +229,16 @@ void Wiedergabe_Bildschirm_Fehler_Wlan(){
   CoreS3.Display.setCursor(36, 50);// anpassen ort
   CoreS3.Display.print("Wlan verbindung verloren");
   Serial.print("Wlan verbindung Verloren");
+}
 
+void Wiedergabe_Bildschirm_Stoerung_Ueberstrom(){
+  CoreS3.Display.clear();
+  CoreS3.Display.clear(WHITE);
+  CoreS3.Display.setTextSize(2);
+  CoreS3.Display.setTextColor(BLACK);
+  CoreS3.Display.setCursor(78, 50);// anpassen ort
+  CoreS3.Display.print("Überstrom ausgelöst");
+  Serial.print("Überstrom ausgelöst");
 }
 
 void Touch_Screen_Ueberpruefung(){
@@ -247,6 +261,7 @@ if (knopfEinAus.justPressed()) {
 void Mess_Task(void *pvParameters) {
   TickType_t letzterStart = xTaskGetTickCount();
   Messwerte m;
+  uint8_t ueberstromZaehler = 0;
 
   for (;;) {
     Messung();
@@ -266,6 +281,17 @@ void Mess_Task(void *pvParameters) {
       xQueueSend(qBefehle, &aus, 0);
     }
     stoerungSensor = fehlerJetzt;
+
+    if (m.strom > STROM_MAX) {
+      ueberstromZaehler++;
+      if (ueberstromZaehler >= UEBERSTROM_ZYKLEN && !stoerungUeberstrom) {
+        stoerungUeberstrom = true;
+        bool aus = false;
+        xQueueSend(qBefehle, &aus, 0);
+      }
+    } else {
+      ueberstromZaehler = 0;
+    }
 
     vTaskDelayUntil(&letzterStart, pdMS_TO_TICKS(1000));
   }
@@ -304,15 +330,15 @@ void Kommunikations_Task(void *pvParameters) {
     vTaskDelay(pdMS_TO_TICKS(50));
   }
 }
-// Relais Ein- und Ausschalten. Wenn Störung, darf es sich nicht einschalten lassen. Dadurch, dass im Aktor, nur einmal vorhanden.
+// Relais Ein- und Ausschalten. Wenn Störung, darf es sich nicht einschalten lassen. 
 void Relais_Task(void *pvParameters) {
   bool wunsch;
   for (;;) {
     if (xQueueReceive(qBefehle, &wunsch, portMAX_DELAY) == pdTRUE) {
-      if (wunsch && (stoerungSensor || stoerungNetz)) wunsch = false;
-        verbraucherEin = wunsch;
-        digitalWrite(Relais_Pin, verbraucherEin ? RELAIS_EIN : RELAIS_AUS);
-        xQueueSend(qStatus, &verbraucherEin, 0);
+      if (wunsch && (stoerungSensor || stoerungNetz || stoerungUeberstrom)) wunsch = false;
+      verbraucherEin = wunsch;
+      digitalWrite(Relais_Pin, verbraucherEin ? RELAIS_EIN : RELAIS_AUS);
+      xQueueSend(qStatus, &verbraucherEin, 0);
     }
   }
 }
@@ -327,13 +353,18 @@ void Anzeige_Task(void *pvParameters) {
                       knopfEinAus.contains(ort.x, ort.y));
 
     if (knopfEinAus.justPressed()) {
-      bool wunsch = !verbraucherEin;
-      xQueueSend(qBefehle, &wunsch, 0);
+      if (stoerungUeberstrom) {
+        stoerungUeberstrom = false;  
+      } else {
+        bool wunsch = !verbraucherEin;
+        xQueueSend(qBefehle, &wunsch, 0);
+      }
     }
 
     if (xQueueReceive(qAnzeige, &m, 0) == pdTRUE) {
-      if (m.fehler != 0) Wiedergabe_Bildschirm_Fehler_Messgeraet();
-      else               Wiedergabe_Bildschirm_Messwerte(m);
+      if (stoerungUeberstrom)   Wiedergabe_Bildschirm_Stoerung_Ueberstrom();
+      else if (m.fehler != 0)   Wiedergabe_Bildschirm_Fehler_Messgeraet();
+      else                      Wiedergabe_Bildschirm_Messwerte(m);
     }
     vTaskDelay(pdMS_TO_TICKS(200));
   }
