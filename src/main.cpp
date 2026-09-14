@@ -23,10 +23,11 @@ int Fehler_Variabel_Messgeraet = 0;
 
 //Knopf auf dem Bildschirm
 LGFX_Button knopfEinAus;
+LGFX_Button knopfZurueck;
 bool verbraucherEin = false;
 
 //Pin für das Relais
-#define Relais_Pin 8
+#define Relais_Pin 9
 #define RELAIS_EIN LOW
 #define RELAIS_AUS HIGH
 
@@ -65,6 +66,8 @@ QueueHandle_t qStatus;
 volatile bool stoerungSensor = false;
 volatile bool stoerungNetz   = false;
 volatile bool stoerungUeberstrom = false;
+volatile bool manuellAus = false;
+
 
 void wlanVerbinden(){
   WiFi.persistent(false);
@@ -76,14 +79,23 @@ void wlanVerbinden(){
 
   wifiMulti.addAP(WLAN_SSID_1, WLAN_PASS_1);
   wifiMulti.addAP(WLAN_SSID_2, WLAN_PASS_2);
-  wifiMulti.addAP(WLAN_SSID_3, WLAN_PASS_3);
+  // wifiMulti.addAP(WLAN_SSID_3, WLAN_PASS_3);
+  wifiMulti.addAP(WLAN_SSID_4, WLAN_PASS_4);
 
-  if (wifiMulti.run(20000) == WL_CONNECTED) {
-  Serial.print("Wlan verbunden");
-  Serial.print(WiFi.SSID());
-  Serial.print(", IP: ");
-  Serial.println(WiFi.localIP());
-} else {
+  for (int versuch = 1; versuch <= 4; versuch++) {
+  Serial.print("WLAN-Versuch "); Serial.println(versuch);
+  if (wifiMulti.run(10000) == WL_CONNECTED) break;
+  delay(500);
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("Wlan verbunden: ");
+    Serial.print(WiFi.SSID());
+    Serial.print(", IP: ");
+    Serial.print(WiFi.localIP());
+    Serial.print(", Gateway: ");
+    Serial.println(WiFi.gatewayIP());
+  } else {
   Serial.println("Wlan verbindung fehlgeschlagen");
 }
 
@@ -97,13 +109,23 @@ void mqttEmpfangen(char* topic, byte* nutzlast, unsigned int laenge) {
   }
 
   if (text == "ein" || text == "aus") {
-    bool wunsch = (text == "ein");
-    xQueueSend(qBefehle, &wunsch, 0);
-  }
+  bool wunsch = (text == "ein");
+  manuellAus = !wunsch;
+  xQueueSend(qBefehle, &wunsch, 0);
 }
-// Last Will:  Nachricht, die der Broker verschickt, falls der CoreS3 unsauber verschwindet.
+}
+// Waehlt den Broker anhand des verbundenen WLAN.
+// Jede SSID hat ihren eigenen Zweig; unbekanntes Netz faellt auf Schule zurueck.
 const char* brokerWaehlen() {
-  if (WiFi.SSID() == WLAN_SSID_2) return MQTT_BROKER_HEIM;
+  String netz = WiFi.SSID();
+  Serial.print("SSID: ["); Serial.print(netz); Serial.println("]");
+
+  if (netz == WLAN_SSID_1) { Serial.println("-> Broker Schule"); return MQTT_BROKER_SCHULE; }
+  if (netz == WLAN_SSID_2) { Serial.println("-> Broker Mobile"); return MQTT_BROKER_MOBILE; }
+  if (netz == WLAN_SSID_3) { Serial.println("-> Broker Heim");   return MQTT_BROKER_HEIM; }
+  if (netz == WLAN_SSID_4) { Serial.println("-> Broker Hotspot"); return MQTT_BROKER_HOTSPOT_TIMO; }
+
+  Serial.println("-> SSID unbekannt, nehme Schule");
   return MQTT_BROKER_SCHULE;
 }
 
@@ -119,6 +141,12 @@ bool mqttVerbinden() {
     mqtt.publish(TOPIC_ONLINE, "online", true);
     mqtt.publish(TOPIC_STATUS, verbraucherEin ? "ein" : "aus", true);
     mqtt.subscribe(TOPIC_BEFEHL, 1);
+  }
+  if (!ok) {
+  Serial.print("MQTT fehlgeschlagen, Broker: ");
+  Serial.print(brokerWaehlen());
+  Serial.print(" rc=");
+  Serial.println(mqtt.state());
   }
   return ok;
 }
@@ -147,6 +175,16 @@ void Messung(){
   } else {
     Fehler_Variabel_Messgeraet = 0;
   }
+}
+
+void Wiedergabe_Bildschirm_Initialisierung(){
+  CoreS3.Display.clear();
+  CoreS3.Display.clear(WHITE);
+  CoreS3.Display.setTextSize(2);
+  CoreS3.Display.setTextColor(BLACK);
+  CoreS3.Display.setCursor(60, 50);
+  CoreS3.Display.print("Initialisiere...");
+  Serial.print("Initialisiere...");
 }
 
 //Wiedergabe der gemessenen Werte im Serial Monotoring
@@ -182,6 +220,26 @@ void Nicht_Veraenderbare_Anzeigen(){
   CoreS3.Display.print("Frequenz:");
   knopfEinAus.drawButton();
 }
+//Wiedergabe anzeige falls relais aus ist
+void Wiedergabe_Bildschirm_Messwerte_NaN(){
+  CoreS3.Display.setTextSize(2);
+  CoreS3.Display.setTextColor(BLACK);
+  CoreS3.Display.fillRect(160, 30, 100, 20, WHITE);
+  CoreS3.Display.setCursor(160, 30);
+  CoreS3.Display.print("NaN");
+  CoreS3.Display.fillRect(160, 60, 100, 20, WHITE);
+  CoreS3.Display.setCursor(160, 60);
+  CoreS3.Display.print("NaN");
+  CoreS3.Display.fillRect(160, 90, 100, 20, WHITE);
+  CoreS3.Display.setCursor(160, 90);
+  CoreS3.Display.print("NaN");
+  CoreS3.Display.fillRect(160, 120, 100, 20, WHITE);
+  CoreS3.Display.setCursor(160, 120);
+  CoreS3.Display.print("NaN");
+  CoreS3.Display.fillRect(160, 150, 100, 20, WHITE);
+  CoreS3.Display.setCursor(160, 150);
+  CoreS3.Display.print("NaN");
+}
 
 //Anzeige der Messwerte. Bekommt Messsatz und nicht globale Variablen. So gehört Anzeige und MQTT Paket immer zusammen.
 void Wiedergabe_Bildschirm_Messwerte(const Messwerte& m){
@@ -216,9 +274,9 @@ void Wiedergabe_Bildschirm_Fehler_Messgeraet(){
   CoreS3.Display.clear(WHITE);
   CoreS3.Display.setTextSize(2);
   CoreS3.Display.setTextColor(BLACK);
-  CoreS3.Display.setCursor(78, 50);// anpassen ort
-  CoreS3.Display.print("Messgerät störung");
-  Serial.print("Messgerät störung");
+  CoreS3.Display.setCursor(48, 50);// anpassen ort
+  CoreS3.Display.print("Messgeraet stoerung");
+  Serial.println("Messgeraet stoerung");
 }
 //Anzeige wenn das Wlan nicht verbunden ist
 void Wiedergabe_Bildschirm_Fehler_Wlan(){
@@ -226,7 +284,7 @@ void Wiedergabe_Bildschirm_Fehler_Wlan(){
   CoreS3.Display.clear(WHITE);
   CoreS3.Display.setTextSize(2);
   CoreS3.Display.setTextColor(BLACK);
-  CoreS3.Display.setCursor(36, 50);// anpassen ort
+  CoreS3.Display.setCursor(15, 50);// anpassen ort
   CoreS3.Display.print("Wlan verbindung verloren");
   Serial.print("Wlan verbindung Verloren");
 }
@@ -236,9 +294,10 @@ void Wiedergabe_Bildschirm_Stoerung_Ueberstrom(){
   CoreS3.Display.clear(WHITE);
   CoreS3.Display.setTextSize(2);
   CoreS3.Display.setTextColor(BLACK);
-  CoreS3.Display.setCursor(78, 50);// anpassen ort
-  CoreS3.Display.print("Überstrom ausgelöst");
-  Serial.print("Überstrom ausgelöst");
+  CoreS3.Display.setCursor(35, 50);// anpassen ort
+  CoreS3.Display.print("Ueberstrom ausgeloest");
+  knopfZurueck.drawButton();
+  Serial.print("Ueberstrom ausgeloest");
 }
 
 void Touch_Screen_Ueberpruefung(){
@@ -246,6 +305,8 @@ void Touch_Screen_Ueberpruefung(){
   auto Beruehrungs_Ort = CoreS3.Touch.getDetail();
   bool gedrueckt = Beruehrungs_Ort.isPressed() && knopfEinAus.contains(Beruehrungs_Ort.x, Beruehrungs_Ort.y);
   knopfEinAus.press(gedrueckt);
+  bool gedruecktZurueck = Beruehrungs_Ort.isPressed() && knopfZurueck.contains(Beruehrungs_Ort.x, Beruehrungs_Ort.y);
+  knopfZurueck.press(gedruecktZurueck);
 
 if (knopfEinAus.justPressed()) {
   verbraucherEin = !verbraucherEin;
@@ -276,11 +337,15 @@ void Mess_Task(void *pvParameters) {
     xQueueSend(qAnzeige,   &m, 0);
 
     bool fehlerJetzt = (m.fehler != 0);
-    if (fehlerJetzt && !stoerungSensor) {
-      bool aus = false;
-      xQueueSend(qBefehle, &aus, 0);
+      if (verbraucherEin) {
+        if (fehlerJetzt && !stoerungSensor) {
+          bool aus = false;
+          xQueueSend(qBefehle, &aus, 0);
+      }
+      stoerungSensor = fehlerJetzt;
+    } else {
+      stoerungSensor = false;
     }
-    stoerungSensor = fehlerJetzt;
 
     if (m.strom > STROM_MAX) {
       ueberstromZaehler++;
@@ -297,14 +362,13 @@ void Mess_Task(void *pvParameters) {
   }
 }
 
-// Einzige Kommunikation zu MQTT! Verbindungsversuche zeitlich begrenzt. (Fehlersuche von unten nach oben. WLAN - MQTT - Nutzdaten)
 void Kommunikations_Task(void *pvParameters) {
   uint32_t naechsterVersuch = 0;
   Messwerte m;
   bool status;
 
   for (;;) {
-    bool netzWeg = (WiFi.status() != WL_CONNECTED) || !mqtt.connected();
+    bool netzWeg = (WiFi.status() != WL_CONNECTED);
     if (netzWeg && !stoerungNetz) {
       bool aus = false;
       xQueueSend(qBefehle, &aus, 0);
@@ -316,7 +380,8 @@ void Kommunikations_Task(void *pvParameters) {
         wifiMulti.run(5000);
         naechsterVersuch = millis() + 10000;
       }
-    } else if (!mqtt.connected()) {
+    }
+    else if (!mqtt.connected()) {
       if (millis() > naechsterVersuch) {
         mqttVerbinden();
         naechsterVersuch = millis() + 5000;
@@ -327,6 +392,7 @@ void Kommunikations_Task(void *pvParameters) {
       if (xQueueReceive(qStatus, &status, 0) == pdTRUE)
         mqtt.publish(TOPIC_STATUS, status ? "ein" : "aus", true);
     }
+    
     vTaskDelay(pdMS_TO_TICKS(50));
   }
 }
@@ -346,25 +412,51 @@ void Relais_Task(void *pvParameters) {
 // Anzeige-Task und Touch-Button. Genau ein Task. Mutex dadurch nicht nötig.
 void Anzeige_Task(void *pvParameters) {
   Messwerte m;
+  int letzterZustand = -1;
   for (;;) {
     CoreS3.update();
     auto ort = CoreS3.Touch.getDetail();
     knopfEinAus.press(ort.isPressed() &&
                       knopfEinAus.contains(ort.x, ort.y));
+    knopfZurueck.press(ort.isPressed() &&
+                      knopfZurueck.contains(ort.x, ort.y));
+                      
 
-    if (knopfEinAus.justPressed()) {
-      if (stoerungUeberstrom) {
-        stoerungUeberstrom = false;  
-      } else {
+   if (stoerungUeberstrom) {
+      if (knopfZurueck.justPressed()) {
+        stoerungUeberstrom = false;
+      }
+    } else {
+      if (knopfEinAus.justPressed()) {
         bool wunsch = !verbraucherEin;
+        manuellAus = !wunsch;
         xQueueSend(qBefehle, &wunsch, 0);
       }
     }
 
     if (xQueueReceive(qAnzeige, &m, 0) == pdTRUE) {
-      if (stoerungUeberstrom)   Wiedergabe_Bildschirm_Stoerung_Ueberstrom();
-      else if (m.fehler != 0)   Wiedergabe_Bildschirm_Fehler_Messgeraet();
-      else                      Wiedergabe_Bildschirm_Messwerte(m);
+      int neuerZustand = stoerungUeberstrom ? 2
+                        : manuellAus         ? 4
+                        : (m.fehler != 0)   ? 1
+                        : stoerungNetz      ? 3
+                        :                      0;
+      bool kommtVonVollbildFehler = (letzterZustand == 1 || letzterZustand == 2 || letzterZustand == 3);
+
+      if (neuerZustand == 0) {
+        if (kommtVonVollbildFehler) Nicht_Veraenderbare_Anzeigen();
+        Wiedergabe_Bildschirm_Messwerte(m);
+      } else if (neuerZustand == 4) {
+        if (kommtVonVollbildFehler) Nicht_Veraenderbare_Anzeigen();
+        Wiedergabe_Bildschirm_Messwerte_NaN();
+      } else if (neuerZustand != letzterZustand) {
+        if      (neuerZustand == 2) 
+        Wiedergabe_Bildschirm_Stoerung_Ueberstrom();
+        else if (neuerZustand == 1) 
+        Wiedergabe_Bildschirm_Fehler_Messgeraet();
+        else                         
+        Wiedergabe_Bildschirm_Fehler_Wlan();
+      }
+      letzterZustand = neuerZustand;
     }
     vTaskDelay(pdMS_TO_TICKS(200));
   }
@@ -375,13 +467,15 @@ void setup() {
   auto cfg = M5.config(); //Struktur mit Einstellungen für den Start
   cfg.output_power = true;   // 5V-Ausgang aktivieren
   CoreS3.begin(cfg);
-  knopfEinAus.initButton(&CoreS3.Display, 140, 210, 80, 40,TFT_BLACK, TFT_BLACK, TFT_WHITE, "Ein/Aus", 1.5, 1.5);
-  
+  knopfEinAus.initButton(&CoreS3.Display, 160, 210, 80, 40,TFT_BLACK, TFT_BLACK, TFT_WHITE, "Ein/Aus", 1.5, 1.5);
+  knopfZurueck.initButton(&CoreS3.Display, 160, 210, 80, 40,TFT_BLACK, TFT_BLACK, TFT_WHITE, "Zurueck", 1.5, 1.5);
   //Pin einlesen
   digitalWrite(Relais_Pin, RELAIS_AUS);
   pinMode(Relais_Pin, OUTPUT);
 
   Serial.begin(115200);
+  Wiedergabe_Bildschirm_Initialisierung();
+  delay(200); 
   wlanVerbinden();
 
   digitalWrite(Relais_Pin, RELAIS_AUS);
@@ -396,8 +490,6 @@ void setup() {
   xTaskCreate(Relais_Task,         "Relais",  2048, NULL, 4, NULL);
   xTaskCreate(Kommunikations_Task, "Komm",    8192, NULL, 2, NULL);
   xTaskCreate(Anzeige_Task,        "Anzeige", 4096, NULL, 1, NULL);
-
-  Nicht_Veraenderbare_Anzeigen();
   
 }
 
